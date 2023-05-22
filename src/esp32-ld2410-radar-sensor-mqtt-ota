@@ -1,0 +1,895 @@
+/*************************************************************************************************
+ * ESP32 LD2410 Radar Sensor
+ * 
+ * Designed to monitor the LD2410 for motion indications and publish via MQTT to a broker
+ * 
+ * Publishing to MQTT is triggered by two different conditions:
+ *  1. once every HEARTBEAT_INTERVAL that you can define in the settings.  This is a heartbeat.
+ *  2. once every RADAR_REPORT_INTERVAL as long as motion is detected. Also defined in settings.
+ * 
+ * OTA checks are done on cold boot and every OTA_CHECK_EVERY defined in settings.
+ * 
+ *  Last updated 2023-05-21
+ *  Written by Scott C. Lemon
+ *  Based on code from:
+ *          https://github.com/ncmreynolds/ld2410
+ * 
+ * Version 1.0.0
+ *  - Using a SmartBee Bee S3 - ESP32 S3
+ *      https://www.tindie.com/products/smartbee/bee-s3-esp32-s3/
+ *  - started with the code above
+ *  - integrated MQTT publish code
+ *  - integrated OTA update code
+ *  - implemented setup and main loop
+ * 
+ * TODO:
+ *    Add the WiFi Manager library to allow dynamic configuration
+ * 
+ *************************************************************************************************/
+
+#include "settings.h"  // These are where all of your settings must be configured!
+
+/*
+ * For the OTA update support
+ */
+#include <esp32FOTA.hpp>
+
+/*
+ * We're going to be using WiFi
+ */
+String wifiMacAddress;
+String wifiIpAddress;
+
+esp32FOTA esp32FOTA;
+
+unsigned long lastOTACheck;
+
+#include <WiFiClientSecure.h>
+
+/*
+ * To use NTP to fetch the current time
+ * https://randomnerdtutorials.com/esp32-date-time-ntp-client-server-arduino/
+ */
+#include "time.h"
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 0;
+const int   daylightOffset_sec = 0;
+
+/*
+ * Get the time and format it to ISO8601
+ * https://cplusplus.com/reference/ctime/strftime/
+ */
+String getNTPTimeString(){
+  struct tm timeinfo;
+  char iso8601[22];
+  
+  if(!getLocalTime(&timeinfo)){
+    Serial.println("Failed to obtain time");
+    return "";
+  }
+
+  //Serial.println(&timeinfo, "%Y-%m-%dT%H:%M:%SZ");
+  strftime(iso8601, sizeof(iso8601), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+  
+  return(String(iso8601));
+}
+
+/*
+ * Print the Local TIme
+ */
+void printLocalTime(){
+  struct tm timeinfo;
+  if(!getLocalTime(&timeinfo)){
+    Serial.println("Failed to obtain time");
+    return;
+  }
+//  Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
+  Serial.println(&timeinfo, "%Y-%m-%d %H:%M:%SZ");
+/*  Serial.print("Day of week: ");
+  Serial.println(&timeinfo, "%A");
+  Serial.print("Month: ");
+  Serial.println(&timeinfo, "%B");
+  Serial.print("Day of Month: ");
+  Serial.println(&timeinfo, "%d");
+  Serial.print("Year: ");
+  Serial.println(&timeinfo, "%Y");
+  Serial.print("Hour: ");
+  Serial.println(&timeinfo, "%H");
+  Serial.print("Hour (12 hour format): ");
+  Serial.println(&timeinfo, "%I");
+  Serial.print("Minute: ");
+  Serial.println(&timeinfo, "%M");
+  Serial.print("Second: ");
+  Serial.println(&timeinfo, "%S");
+
+  Serial.println("Time variables");
+  char timeHour[3];
+  strftime(timeHour,3, "%H", &timeinfo);
+  Serial.println(timeHour);
+  char timeWeekDay[10];
+  strftime(timeWeekDay,10, "%A", &timeinfo);
+  Serial.println(timeWeekDay);
+  Serial.println();
+  */
+}
+
+#include <ArduinoMqttClient.h>
+
+#if ENABLE_MQTT
+  // NOTE: These MQTT connect errors start at -2 and so must be offset by 2 to print correctly
+  String mqttConnectError[] = {
+    "MQTT_CONNECTION_REFUSED",
+    "MQTT_CONNECTION_TIMEOUT",
+    "MQTT_SUCCESS",
+    "MQTT_UNACCEPTABLE_PROTOCOL_VERSION",
+    "MQTT_IDENTIFIER_REJECTED",
+    "MQTT_SERVER_UNAVAILABLE",
+    "MQTT_BAD_USER_NAME_OR_PASSWORD",
+    "MQTT_NOT_AUTHORIZED"
+    };
+
+  // MQTT is using modem connection 1
+  #if USE_MQTTS
+    WiFiClientSecure mqtt_client;
+    MqttClient mqtt(mqtt_client);
+  #else
+    WiFiClient mqtt_client;
+    MqttClient mqtt(mqtt_client);
+  #endif
+#endif
+
+// ===== begin code for LD2410 =====
+
+#if defined(ESP32)
+  #ifdef ESP_IDF_VERSION_MAJOR // IDF 4+
+    #if CONFIG_IDF_TARGET_ESP32 // ESP32/PICO-D4
+      #define MONITOR_SERIAL Serial
+      #define RADAR_SERIAL Serial1
+      #define RADAR_RX_PIN 32
+      #define RADAR_TX_PIN 33
+    #elif CONFIG_IDF_TARGET_ESP32S2
+      #define MONITOR_SERIAL Serial
+      #define RADAR_SERIAL Serial1
+      #define RADAR_RX_PIN 9
+      #define RADAR_TX_PIN 8
+    #elif CONFIG_IDF_TARGET_ESP32S3
+      #define MONITOR_SERIAL Serial
+      #define RADAR_SERIAL Serial1
+      #define RADAR_RX_PIN 44
+      #define RADAR_TX_PIN 43
+    #elif CONFIG_IDF_TARGET_ESP32C3
+      #define MONITOR_SERIAL Serial
+      #define RADAR_SERIAL Serial1
+      #define RADAR_RX_PIN 4
+      #define RADAR_TX_PIN 5
+    #else 
+      #error Target CONFIG_IDF_TARGET is not supported
+    #endif
+  #else // ESP32 Before IDF 4.0
+    #define MONITOR_SERIAL Serial
+    #define RADAR_SERIAL Serial1
+    #define RADAR_RX_PIN 32
+    #define RADAR_TX_PIN 33
+  #endif
+#elif defined(__AVR_ATmega32U4__)
+  #define MONITOR_SERIAL Serial
+  #define RADAR_SERIAL Serial1
+  #define RADAR_RX_PIN 0
+  #define RADAR_TX_PIN 1
+#endif
+
+#include <ld2410.h>
+
+ld2410 radar;
+
+// radar related variables
+uint32_t  lastReading = 0;
+boolean   radarConnected = false;
+boolean   pDetected;
+boolean   stDetected;
+uint16_t  stDistance;
+uint8_t   stEnergy;
+boolean   mtDetected;
+uint16_t  mtDistance;
+uint8_t   mtEnergy;
+boolean   noTargetBegin = false;
+boolean   lastNoTarget = true;
+
+// to store the unique ID of the ESP32
+char      espDeviceId[20];
+
+// various loop and timing variables
+boolean   ledState = false;
+uint32_t  gotNetwork = millis();
+uint32_t  lostNetwork = millis();
+uint32_t  secondsWithoutNetwork = -1;
+uint32_t  lastHeartbeatTimestamp = 0;
+boolean   networkConnected = false;
+boolean   networkConnectedChanged = false;
+uint32_t  waitingStarted = 0;
+uint32_t  lastWaitingMessage = 0;
+
+/**************************************************************************************
+ * 
+ * WiFiEvent() - Display all WiFi events
+ *    
+ **************************************************************************************/
+//#define WIFI_DEBUG
+#ifdef WIFI_DEBUG
+/*
+* WiFi Events
+0  ARDUINO_EVENT_WIFI_READY               < ESP32 WiFi ready
+1  ARDUINO_EVENT_WIFI_SCAN_DONE                < ESP32 finish scanning AP
+2  ARDUINO_EVENT_WIFI_STA_START                < ESP32 station start
+3  ARDUINO_EVENT_WIFI_STA_STOP                 < ESP32 station stop
+4  ARDUINO_EVENT_WIFI_STA_CONNECTED            < ESP32 station connected to AP
+5  ARDUINO_EVENT_WIFI_STA_DISCONNECTED         < ESP32 station disconnected from AP
+6  ARDUINO_EVENT_WIFI_STA_AUTHMODE_CHANGE      < the auth mode of AP connected by ESP32 station changed
+7  ARDUINO_EVENT_WIFI_STA_GOT_IP               < ESP32 station got IP from connected AP
+8  ARDUINO_EVENT_WIFI_STA_LOST_IP              < ESP32 station lost IP and the IP is reset to 0
+9  ARDUINO_EVENT_WPS_ER_SUCCESS       < ESP32 station wps succeeds in enrollee mode
+10 ARDUINO_EVENT_WPS_ER_FAILED        < ESP32 station wps fails in enrollee mode
+11 ARDUINO_EVENT_WPS_ER_TIMEOUT       < ESP32 station wps timeout in enrollee mode
+12 ARDUINO_EVENT_WPS_ER_PIN           < ESP32 station wps pin code in enrollee mode
+13 ARDUINO_EVENT_WIFI_AP_START                 < ESP32 soft-AP start
+14 ARDUINO_EVENT_WIFI_AP_STOP                  < ESP32 soft-AP stop
+15 ARDUINO_EVENT_WIFI_AP_STACONNECTED          < a station connected to ESP32 soft-AP
+16 ARDUINO_EVENT_WIFI_AP_STADISCONNECTED       < a station disconnected from ESP32 soft-AP
+17 ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED         < ESP32 soft-AP assign an IP to a connected station
+18 ARDUINO_EVENT_WIFI_AP_PROBEREQRECVED        < Receive probe request packet in soft-AP interface
+19 ARDUINO_EVENT_WIFI_AP_GOT_IP6               < ESP32 ap interface v6IP addr is preferred
+19 ARDUINO_EVENT_WIFI_STA_GOT_IP6              < ESP32 station interface v6IP addr is preferred
+20 ARDUINO_EVENT_ETH_START                < ESP32 ethernet start
+21 ARDUINO_EVENT_ETH_STOP                 < ESP32 ethernet stop
+22 ARDUINO_EVENT_ETH_CONNECTED            < ESP32 ethernet phy link up
+23 ARDUINO_EVENT_ETH_DISCONNECTED         < ESP32 ethernet phy link down
+24 ARDUINO_EVENT_ETH_GOT_IP               < ESP32 ethernet got IP from connected AP
+19 ARDUINO_EVENT_ETH_GOT_IP6              < ESP32 ethernet interface v6IP addr is preferred
+25 ARDUINO_EVENT_MAX
+*/
+
+void WiFiEvent(WiFiEvent_t event)
+{
+    Serial.printf("[WiFi-event] event: %d\n", event);
+
+    switch (event) {
+        case ARDUINO_EVENT_WIFI_READY: 
+            Serial.println("WiFi interface ready");
+            break;
+        case ARDUINO_EVENT_WIFI_SCAN_DONE:
+            Serial.println("Completed scan for access points");
+            break;
+        case ARDUINO_EVENT_WIFI_STA_START:
+            Serial.println("WiFi client started");
+            break;
+        case ARDUINO_EVENT_WIFI_STA_STOP:
+            Serial.println("WiFi clients stopped");
+            break;
+        case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+            Serial.println("Connected to access point");
+            break;
+        case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+            Serial.println("Disconnected from WiFi access point");
+            break;
+        case ARDUINO_EVENT_WIFI_STA_AUTHMODE_CHANGE:
+            Serial.println("Authentication mode of access point has changed");
+            break;
+        case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+            Serial.print("Obtained IP address: ");
+            Serial.println(WiFi.localIP());
+            break;
+        case ARDUINO_EVENT_WIFI_STA_LOST_IP:
+            Serial.println("Lost IP address and IP address is reset to 0");
+            break;
+        case ARDUINO_EVENT_WPS_ER_SUCCESS:
+            Serial.println("WiFi Protected Setup (WPS): succeeded in enrollee mode");
+            break;
+        case ARDUINO_EVENT_WPS_ER_FAILED:
+            Serial.println("WiFi Protected Setup (WPS): failed in enrollee mode");
+            break;
+        case ARDUINO_EVENT_WPS_ER_TIMEOUT:
+            Serial.println("WiFi Protected Setup (WPS): timeout in enrollee mode");
+            break;
+        case ARDUINO_EVENT_WPS_ER_PIN:
+            Serial.println("WiFi Protected Setup (WPS): pin code in enrollee mode");
+            break;
+        case ARDUINO_EVENT_WIFI_AP_START:
+            Serial.println("WiFi access point started");
+            break;
+        case ARDUINO_EVENT_WIFI_AP_STOP:
+            Serial.println("WiFi access point  stopped");
+            break;
+        case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
+            Serial.println("Client connected");
+            break;
+        case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:
+            Serial.println("Client disconnected");
+            break;
+        case ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED:
+            Serial.println("Assigned IP address to client");
+            break;
+        case ARDUINO_EVENT_WIFI_AP_PROBEREQRECVED:
+            Serial.println("Received probe request");
+            break;
+        case ARDUINO_EVENT_WIFI_AP_GOT_IP6:
+            Serial.println("AP IPv6 is preferred");
+            break;
+        case ARDUINO_EVENT_WIFI_STA_GOT_IP6:
+            Serial.println("STA IPv6 is preferred");
+            break;
+        case ARDUINO_EVENT_ETH_GOT_IP6:
+            Serial.println("Ethernet IPv6 is preferred");
+            break;
+        case ARDUINO_EVENT_ETH_START:
+            Serial.println("Ethernet started");
+            break;
+        case ARDUINO_EVENT_ETH_STOP:
+            Serial.println("Ethernet stopped");
+            break;
+        case ARDUINO_EVENT_ETH_CONNECTED:
+            Serial.println("Ethernet connected");
+            break;
+        case ARDUINO_EVENT_ETH_DISCONNECTED:
+            Serial.println("Ethernet disconnected");
+            break;
+        case ARDUINO_EVENT_ETH_GOT_IP:
+            Serial.println("Obtained IP address");
+            break;
+        default: break;
+    }}
+
+/**************************************************************************************
+ * 
+ * WiFiGotIP() - This prints the IP address once WiFi is connected
+ *    
+ **************************************************************************************/
+void WiFiGotIP(WiFiEvent_t event, WiFiEventInfo_t info)
+{
+    Serial.println("WiFi connected");
+    Serial.println("IP address: ");
+    Serial.println(IPAddress(info.got_ip.ip_info.ip.addr));
+}
+#endif    // ifdef WIFI_DEBUG
+
+/**************************************************************************************
+ * 
+ * setup_wifi() - This is to set-up and connect to WiFi
+ *    
+ **************************************************************************************/
+void setup_wifi()
+{
+  delay(10);
+  Serial.printf("Connecting to: %s\n", ssid);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected!");
+  wifiMacAddress = WiFi.macAddress();
+  Serial.print("MAC Address: ");
+  Serial.println(wifiMacAddress);
+  wifiIpAddress = WiFi.localIP().toString().c_str();
+  Serial.print("IP Address: ");
+  Serial.println(wifiIpAddress);
+  Serial.print("RRSI: ");
+  Serial.println(WiFi.RSSI());
+}
+
+/*
+ * ESP32 Reboot Function
+ */
+void IRAM_ATTR resetModule(){
+    ets_printf("reboot\n");
+    esp_restart();
+}
+
+/**************************************************************************************
+ * 
+ * Setup
+ *    
+ **************************************************************************************/
+boolean  cold_boot      = true;
+boolean  cold_boot_ota  = true;
+
+void setup(void)
+{
+  // get the ESP32 unique ID
+  snprintf(espDeviceId, 20, "DEVICE-%llX", ESP.getEfuseMac());
+
+  MONITOR_SERIAL.begin(115200); //Feedback over Serial Monitor
+  delay(5000);
+
+  MONITOR_SERIAL.println("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^");
+  MONITOR_SERIAL.println("============================================================================");
+  MONITOR_SERIAL.print("ESP32 - LD2410 Radar Sensor - ");
+  MONITOR_SERIAL.println(espDeviceId);
+  MONITOR_SERIAL.println("============================================================================");
+  MONITOR_SERIAL.print("Firmware Type: ");
+  MONITOR_SERIAL.println(firmwareType);
+  MONITOR_SERIAL.print("Firmware Version: ");
+  MONITOR_SERIAL.print(FIRMWARE_MAJOR_VERSION);
+  MONITOR_SERIAL.print(".");
+  MONITOR_SERIAL.print(FIRMWARE_MINOR_VERSION);
+  MONITOR_SERIAL.print(".");
+  MONITOR_SERIAL.println(FIRMWARE_PATCH_VERSION);
+  MONITOR_SERIAL.print("Firmware Version String: ");
+  MONITOR_SERIAL.println(FIRMWARE_VERSION_STRING);
+  
+  pinMode(LED_PIN, OUTPUT);     // Initialize the LED_PIN as an output
+ 
+ /*
+ * Start WiFi connection ...
+ */  
+  // Examples of different ways to register wifi events
+#ifdef WIFI_DEBUG
+  WiFi.onEvent(WiFiEvent);
+  WiFi.onEvent(WiFiGotIP, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_GOT_IP);
+#endif
+
+/*
+ * This code is specifically to handle a failure to connect WiFi on reboot
+ */  
+  WiFiEventId_t eventID = WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info){
+      Serial.print("WiFi lost connection. Reason: ");
+      Serial.println(info.wifi_sta_disconnected.reason);
+      if (info.wifi_sta_disconnected.reason == 15) {
+        ESP.restart();
+      }
+  }, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+
+#ifdef WIFI_DEBUG
+  // Remove WiFi event
+  Serial.print("WiFi Event ID: ");
+  Serial.println(eventID);
+  // WiFi.removeEvent(eventID);
+#endif
+
+  setup_wifi();
+  
+  //
+  // Using the esp32FOTAT late cfg method
+  //
+  {
+    auto cfg = esp32FOTA.getConfig();
+    cfg.name          = (char *)firmwareType;
+    cfg.sem           = SemverClass( FIRMWARE_MAJOR_VERSION, FIRMWARE_MINOR_VERSION, FIRMWARE_PATCH_VERSION ); // major, minor, patch
+    cfg.manifest_url  = "http://warp-1.wovyn.com/esp32fota/esp32FOTA-test.json";
+    cfg.check_sig     = false; // verify signed firmware with rsa public key
+    cfg.unsafe        = true; // disable certificate check when using TLS
+    //cfg.root_ca       = MyRootCA;
+    //cfg.pub_key       = MyRSAKey;
+    cfg.use_device_id = true;
+    esp32FOTA.setConfig( cfg );
+  }
+  
+  //radar.debug(MONITOR_SERIAL); //Uncomment to show debug information from the library on the Serial Monitor. By default this does not show sensor reads as they are very frequent.
+
+  #if defined(ESP32)
+    RADAR_SERIAL.begin(256000, SERIAL_8N1, RADAR_RX_PIN, RADAR_TX_PIN); //UART for monitoring the radar
+  #elif defined(__AVR_ATmega32U4__)
+    RADAR_SERIAL.begin(256000); //UART for monitoring the radar
+  #endif
+  delay(500);
+  MONITOR_SERIAL.print(F("\nConnect LD2410 radar TX to GPIO:"));
+  MONITOR_SERIAL.println(RADAR_RX_PIN);
+  MONITOR_SERIAL.print(F("Connect LD2410 radar RX to GPIO:"));
+  MONITOR_SERIAL.println(RADAR_TX_PIN);
+  MONITOR_SERIAL.print(F("LD2410 radar sensor initialising: "));
+  if(radar.begin(RADAR_SERIAL))
+  {
+    MONITOR_SERIAL.println(F("OK"));
+    MONITOR_SERIAL.print(F("LD2410 firmware version: "));
+    MONITOR_SERIAL.print(radar.firmware_major_version);
+    MONITOR_SERIAL.print('.');
+    MONITOR_SERIAL.print(radar.firmware_minor_version);
+    MONITOR_SERIAL.print('.');
+    MONITOR_SERIAL.println(radar.firmware_bugfix_version, HEX);
+  }
+  else
+  {
+    MONITOR_SERIAL.println(F("not connected"));
+  }
+
+  Serial.println("===== Setup Complete | Entering Loop =====");
+}
+
+/**************************************************************************************
+ * 
+ * Loop
+ * 
+ * In the loop we want to:
+ * 
+ *  - check for OTA on cold boot, and every OTA_CHECK_EVERY millis
+ *  - toggle the LED
+ *  - read the radar sensor
+ *    - check if it's been 1 second
+ *    - print the radar results
+ *    - if it's the default posting interval then post
+ *    - if there is motion detected then post
+ *  
+ **************************************************************************************/
+void loop()
+{
+  // do we need to do an OTA check?
+  //   - check on cold boot
+  //   - check every OTA_CHECK_EVERY
+  if(cold_boot_ota || millis() - lastOTACheck > OTA_CHECK_EVERY){
+    Serial.println("============================================================================");
+    Serial.println("Performing FOTA Update Check ...");
+
+    bool updateNeeded = esp32FOTA.execHTTPcheck();
+    Serial.printf("updateNeeded: %s\n", updateNeeded ? "true" : "false");
+    if (updateNeeded) {
+      Serial.println("Update needed!");
+      esp32FOTA.execOTA();
+    } else {
+      Serial.println("No update needed!");
+    }
+    // set lastOTACheck
+    lastOTACheck = millis();
+    cold_boot_ota = false;
+  }
+
+/******************************************************************************
+ * 
+ *   read values from the radar sensor
+ *   
+ ******************************************************************************/
+  radar.read();
+
+  // is it time to report and do our checks?
+  if(radar.isConnected() && millis() - lastReading > RADAR_REPORT_INTERVAL)
+  {
+    lastReading = millis();
+
+    // toggle the LED
+    //Serial.println("Toggle LED");
+    if (ledState == true) {
+      digitalWrite(LED_PIN, LOW);   // Turn the LED on (Note that LOW is the voltage level but actually the LED is on)
+      ledState = false;
+    } else {
+      digitalWrite(LED_PIN, HIGH);  // Turn the LED off by making the voltage HIGH
+      ledState = true;
+    }
+
+    Serial.println("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++");
+    Serial.print("Next OTA Check in: ");
+    Serial.print((OTA_CHECK_EVERY - (millis() - lastOTACheck)) / 1000);
+    Serial.println(" seconds");
+    Serial.print("Free Heap: ");
+    Serial.println(ESP.getFreeHeap());
+
+    // if we are running low on heap then restart
+    // TODO: This is a workaround for memory leaks!
+    if (ESP.getFreeHeap() < 50000) {
+            ESP.restart();
+    }
+
+    // has anything been detected?
+    pDetected = radar.presenceDetected();
+    if(pDetected)
+    {
+      stDetected = radar.stationaryTargetDetected();
+      if(stDetected)
+      {
+        Serial.print(F("Stationary target: "));
+        stDistance = radar.stationaryTargetDistance();
+        Serial.print(stDistance);
+        Serial.print(F("cm energy:"));
+        stEnergy = radar.stationaryTargetEnergy();
+        Serial.print(stEnergy);
+        Serial.print(' ');
+      } else {
+        stDistance = 0;
+        stEnergy = 0;
+      }
+
+      mtDetected = radar.movingTargetDetected();
+
+      if(mtDetected)
+      {
+        Serial.print(F("Moving target: "));
+        mtDistance = radar.movingTargetDistance();
+        Serial.print(mtDistance);
+        Serial.print(F("cm energy:"));
+        mtEnergy = radar.movingTargetEnergy();
+        Serial.print(mtEnergy);
+      } else {
+        mtDistance = 0;
+        mtEnergy = 0;
+      }
+      Serial.println();
+      lastNoTarget = false;
+    }
+    else
+    {
+      Serial.println(F("No target"));
+      if (lastNoTarget == false && pDetected == false)
+      {
+        noTargetBegin = true;
+      } else {
+        noTargetBegin = false;
+      }
+      lastNoTarget = true;
+      stDetected = false;
+      stDistance = 0;
+      stEnergy = 0;
+      mtDetected = false;
+      mtDistance = 0;
+      mtEnergy = 0;
+    }
+  
+    /**************************************************************************************
+     * 
+     *  On each loop we want to detect if we are WiFi connected or not.
+     *  This will be used to log how long we were disconnected.
+     *  
+     **************************************************************************************/
+    if (WiFi.status() == WL_CONNECTED) {
+        if (!networkConnected) {
+          Serial.println("Network changed to connected!");
+          gotNetwork = millis();
+          if (secondsWithoutNetwork == -1) {
+            // this is to deal with the first run of the loop
+            secondsWithoutNetwork = 0;
+          } else {
+            // this is for any time after the first run of the loop
+            secondsWithoutNetwork = lostNetwork - gotNetwork;            
+          }
+          networkConnected = true;
+          networkConnectedChanged = true;
+        } else {
+          //Serial.println("Network still connected!");
+          gotNetwork = millis();
+          lostNetwork = millis();
+          //secondsWithoutNetwork = lostNetwork - gotNetwork;
+          networkConnectedChanged = false;          
+        }
+    } else {
+        if (networkConnected) {
+          Serial.println("Network changed to disconnected!");
+          lostNetwork = millis();
+          //secondsWithoutNetwork = lostNetwork - gotNetwork;
+          networkConnected = false;
+          networkConnectedChanged = true;
+        } else {
+          //Serial.println("Network still disconnected!");
+          networkConnectedChanged = false;          
+          lostNetwork = millis();
+          secondsWithoutNetwork = lostNetwork - gotNetwork;
+        }
+    }
+    //Serial.println("Completed network connection check!");
+  
+    // Are we starting a new wait to update the broker?
+    if (waitingStarted == 0){
+      waitingStarted = millis();
+      lastWaitingMessage = waitingStarted;
+    }
+    //Serial.println("Completed wait init check!");
+  
+    if (((millis() - lastWaitingMessage) / 1000) >= WAITING_MESSAGE_EVERY_SECONDS) {
+      Serial.println("Waited " + String((millis() - waitingStarted) / 1000) + " seconds of " + String(HEARTBEAT_INTERVAL) + " second heartbeat interval ...");
+      lastWaitingMessage = millis();
+      
+  #if ENABLE_MQTT
+        if(mqtt.connected()) {
+          Serial.println("Poll MQTT Broker to keep connection alive!");
+          mqtt.poll();
+        }
+  #endif
+  
+    }
+    //Serial.println("Completed wait message check!");
+  
+    // if we have no WiFi then return at this point!
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("In MQTT update, but no WiFi!");
+      return;
+    }
+  
+    if (networkConnectedChanged) {
+      wifiIpAddress = WiFi.localIP().toString().c_str();
+      Serial.println("Network change detected!");
+      Serial.println("Local IP: " + wifiIpAddress);
+    }
+  
+    /*
+     * is it time to update the MQTT broker?
+     *  - on cold boot
+     *  - every HEARTBEAT_INTERVAL
+     *  - if there is motion detected
+     *  - if motion ended
+     */
+    if (cold_boot || (millis() - lastHeartbeatTimestamp) >= HEARTBEAT_INTERVAL * 1000 || mtDetected || noTargetBegin) {
+  
+      Serial.println(">> Time to update broker!");
+      Serial.print("Firmware version: ");
+      Serial.println(FIRMWARE_VERSION_STRING);
+  
+      // Init and get the time
+      configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+      printLocalTime();
+    
+  #if ENABLE_MQTT
+      // update mqtt ...
+      if (POST_TO_ENDPOINT && ENABLE_MQTT) {
+        Serial.println("Updating MQTT ... ");
+  
+        if (!mqtt.connected()) {
+          Serial.print("Attempting to connect to the MQTT broker: ");
+          Serial.println(broker);
+  
+          // set the MQTT parameters
+          mqtt.setId(clientId + wifiMacAddress);
+          mqtt.setUsernamePassword(mqttUserName, mqttPassword);
+          mqtt_client.setInsecure();
+    
+          if (!mqtt.connect(broker, mqttPort)) {
+            Serial.print("MQTT connection failed! Error code = ");
+            Serial.println(mqtt.connectError());
+            Serial.println(mqttConnectError[mqtt.connectError()+2]);
+            Serial.println("Waiting 15 seconds to retry ...");
+            delay(15000);
+            //mqtt.stop();
+  
+            // have we been unable to connect for too long?
+            // three times the configured heartbeat interval ought to be good to restart?
+            if ((millis() - lastHeartbeatTimestamp) >= (HEARTBEAT_INTERVAL * 3) * 1000) {
+              ESP.restart();
+            } else {
+              return;            
+            }
+          } // end trying to reconnect
+        } // end if !connected
+        
+        Serial.println("Connected to the MQTT broker!");
+  
+        String updateTime = getNTPTimeString();
+  
+        mqtt.poll();
+  
+        Serial.print("Updating MQTT topic: ");
+        Serial.print("Wovyn/ESP32/LD2410-Radar/" + wifiMacAddress + "/firmwareVersion");
+        Serial.print("  Value: ");
+        Serial.println(FIRMWARE_VERSION_STRING);
+        Serial.print("Free Heap: ");
+        Serial.println(ESP.getFreeHeap());
+  
+        // Update MQTT using print interface to set the message contents
+        mqtt.beginMessage("Wovyn/LD2410-Radar/" + wifiMacAddress + "/firmwareVersion");
+        mqtt.print(FIRMWARE_VERSION_STRING);
+        mqtt.endMessage();
+        mqtt.flush();
+  
+        Serial.print("Updating MQTT topic: ");
+        Serial.print("Wovyn/LD2410-Radar/" + wifiMacAddress + "/IpAddress");
+        Serial.print("  Value: ");
+        Serial.println(wifiIpAddress);
+        Serial.print("Free Heap: ");
+        Serial.println(ESP.getFreeHeap());
+  
+        // Update MQTT using print interface to set the message contents
+        mqtt.beginMessage("Wovyn/LD2410-Radar/" + wifiMacAddress + "/IpAddress");
+        mqtt.print(wifiIpAddress);
+        mqtt.endMessage();
+        mqtt.flush();
+  
+        Serial.print("Updating MQTT topic: ");
+        Serial.print("Wovyn/LD2410-Radar/" + wifiMacAddress + "/currentHeap");
+        Serial.print("  Value: ");
+        Serial.println(ESP.getFreeHeap());
+        Serial.print("Free Heap: ");
+        Serial.println(ESP.getFreeHeap());
+  
+        // Update MQTT using print interface to set the message contents
+        mqtt.beginMessage("Wovyn/LD2410-Radar/" + wifiMacAddress + "/currentHeap");
+        mqtt.print(ESP.getFreeHeap());
+        mqtt.endMessage();
+        mqtt.flush();
+  
+        Serial.print("Updating MQTT topic: ");
+        Serial.print("Wovyn/LD2410-Radar/" + wifiMacAddress + "/lastUpdate");
+        Serial.print("  Value: ");
+        Serial.println(updateTime);
+        Serial.print("Free Heap: ");
+        Serial.println(ESP.getFreeHeap());
+  
+        // Update MQTT using print interface to set the message contents
+        mqtt.beginMessage("Wovyn/LD2410-Radar/" + wifiMacAddress + "/lastUpdate");
+        mqtt.print(updateTime);
+        mqtt.endMessage();
+        mqtt.flush();
+  
+        // We want to track reboots in MQTT.  Was this a cold boot?
+        if (cold_boot)
+        {
+          Serial.print("Updating MQTT topic: ");
+          Serial.print("Wovyn/LD2410-Radar/" + wifiMacAddress + "/lastColdBoot");
+          Serial.print("  Value: ");
+          Serial.println(updateTime);
+          Serial.print("Free Heap: ");
+          Serial.println(ESP.getFreeHeap());
+    
+          // Update MQTT using print interface to set the message contents
+          mqtt.beginMessage("Wovyn/LD2410-Radar/" + wifiMacAddress + "/lastColdBoot");
+          mqtt.print(updateTime);
+          mqtt.endMessage();
+          mqtt.flush();
+        }
+  
+        Serial.print("Updating MQTT topic: ");
+        Serial.print("Wovyn/LD2410-Radar/" + wifiMacAddress + "/stationaryDistance");
+        Serial.print("  Value: ");
+        Serial.println(stDistance);
+        Serial.print("Free Heap: ");
+        Serial.println(ESP.getFreeHeap());
+    
+        // Update MQTT using print interface to set the message contents
+        mqtt.beginMessage("Wovyn/LD2410-Radar/" + wifiMacAddress + "/stationaryDistance");
+        mqtt.print(stDistance);
+        mqtt.endMessage();
+        mqtt.flush();
+  
+        Serial.print("Updating MQTT topic: ");
+        Serial.print("Wovyn/LD2410-Radar/" + wifiMacAddress + "/stationaryEnergy");
+        Serial.print("  Value: ");
+        Serial.println(stEnergy);
+        Serial.print("Free Heap: ");
+        Serial.println(ESP.getFreeHeap());
+    
+        // Update MQTT using print interface to set the message contents
+        mqtt.beginMessage("Wovyn/LD2410-Radar/" + wifiMacAddress + "/stationaryEnergy");
+        mqtt.print(stEnergy);
+        mqtt.endMessage();
+        mqtt.flush();
+  
+        Serial.print("Updating MQTT topic: ");
+        Serial.print("Wovyn/LD2410-Radar/" + wifiMacAddress + "/motionDistance");
+        Serial.print("  Value: ");
+        Serial.println(mtDistance);
+        Serial.print("Free Heap: ");
+        Serial.println(ESP.getFreeHeap());
+    
+        // Update MQTT using print interface to set the message contents
+        mqtt.beginMessage("Wovyn/LD2410-Radar/" + wifiMacAddress + "/motionDistance");
+        mqtt.print(mtDistance);
+        mqtt.endMessage();
+        mqtt.flush();
+  
+        Serial.print("Updating MQTT topic: ");
+        Serial.print("Wovyn/LD2410-Radar/" + wifiMacAddress + "/motionEnergy");
+        Serial.print("  Value: ");
+        Serial.println(mtEnergy);
+        Serial.print("Free Heap: ");
+        Serial.println(ESP.getFreeHeap());
+    
+        // Update MQTT using print interface to set the message contents
+        mqtt.beginMessage("Wovyn/LD2410-Radar/" + wifiMacAddress + "/motionEnergy");
+        mqtt.print(mtEnergy);
+        mqtt.endMessage();
+        mqtt.flush();
+  
+        //mqtt.stop();
+        //Serial.println("Stopped MQTT Connection");
+  
+      } // end mqtt updates
+  
+  #endif
+  
+      Serial.println("... end of sending to endpoints!");
+  
+      // reset the last heartbeat timestamp and messages variables
+      lastHeartbeatTimestamp = millis();
+      waitingStarted = 0;
+      lastWaitingMessage = 0;
+  
+      Serial.println("<< Waiting " + String(HEARTBEAT_INTERVAL) + " seconds until next send!");
+  
+      // reset the cold boot flag
+      cold_boot = false;
+  
+    }   // end if it's time to heartbeat
+  }     // end the RADAR_REPORT_INTERVAL check
+}
