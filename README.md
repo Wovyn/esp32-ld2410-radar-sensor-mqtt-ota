@@ -24,9 +24,12 @@ Version 1.0.0
  - integrated OTA update code
  - implemented setup and main loop
 
-TODO:
+**TODO:**
    Add the WiFi Manager library to allow dynamic configuration
+   
 ---------------------------------------------------
+
+**Wiring and Pins**
 Make sure to pay attention to the pins being used!
 
 Using a UART is highly recommended due to the high data rate.  Wire your module according to the
