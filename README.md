@@ -32,6 +32,7 @@ Make sure to pay attention to the pins being used!
 Using a UART is highly recommended due to the high data rate.  Wire your module according to the
 following code, or modify the code to match your module.
 
+```
 #if defined(ESP32)
   #ifdef ESP_IDF_VERSION_MAJOR // IDF 4+
     #if CONFIG_IDF_TARGET_ESP32 // ESP32/PICO-D4
@@ -69,3 +70,4 @@ following code, or modify the code to match your module.
   #define RADAR_RX_PIN 0
   #define RADAR_TX_PIN 1
 #endif
+```
