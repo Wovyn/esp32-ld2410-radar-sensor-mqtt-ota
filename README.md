@@ -1,7 +1,11 @@
 # esp32-ld2410-radar-sensor-mqtt-ota
 An Arduino sketch for an ESP32 using the LD2410 as a Radar Sensor with MQTT reporting and OTA
 
-ESP32 LD2410 Radar Sensor
+Written by: Scott C. Lemon  
+Based on code from:  
+         https://github.com/ncmreynolds/ld2410
+
+## ESP32 LD2410 Radar Sensor
 
 Designed to monitor the LD2410 for motion indications and publish via MQTT to a broker
 
@@ -11,12 +15,9 @@ Publishing to MQTT is triggered by two different conditions:
 
 OTA checks are done on cold boot and every OTA_CHECK_EVERY defined in settings.
 
- Last updated 2023-05-21
- Written by Scott C. Lemon
- Based on code from:
-         https://github.com/ncmreynolds/ld2410
+---
 
-Version 1.0.0
+Version 1.0.0 - 2023-05-21
  - Using a SmartBee Bee S3 - ESP32 S3
      https://www.tindie.com/products/smartbee/bee-s3-esp32-s3/
  - started with the code above
@@ -24,12 +25,14 @@ Version 1.0.0
  - integrated OTA update code
  - implemented setup and main loop
 
-**TODO:**
-   Add the WiFi Manager library to allow dynamic configuration
-   
----------------------------------------------------
+---
 
-**Wiring and Pins**
+**TODO:**  
+  - Add the WiFi Manager library to allow dynamic configuration
+   
+---
+
+## **Wiring and Pins**  
 Make sure to pay attention to the pins being used!
 
 Using a UART is highly recommended due to the high data rate.  Wire your module according to the
