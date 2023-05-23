@@ -5,6 +5,8 @@ Written by: Scott C. Lemon
 Based on code from:  
          https://github.com/ncmreynolds/ld2410
 
+LD2410 Sensors can be purchased on Ali Express here:  https://a.aliexpress.com/_msGWAuG
+
 ## ESP32 LD2410 Radar Sensor
 
 Designed to monitor the LD2410 for motion indications and publish via MQTT to a broker
